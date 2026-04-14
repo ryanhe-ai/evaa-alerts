@@ -1,0 +1,87 @@
+name: EVAA Phase Alert
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-phase:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run phase detection
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          node << 'NODEEOF'
+          const https = require('https');
+          const TOKEN = process.env.TG_TOKEN;
+          const CHAT_ID = process.env.TG_CHAT_ID;
+          const SYM = 'EVAAUSDT';
+          function get(url) {
+            return new Promise((resolve,reject) => {
+              https.get(url, res => {
+                let data = '';
+                res.on('data', d => data += d);
+                res.on('end', () => resolve(JSON.parse(data)));
+              }).on('error', reject);
+            });
+          }
+          function post(url, body) {
+            return new Promise((resolve,reject) => {
+              const data = JSON.stringify(body);
+              const u = new URL(url);
+              const req = https.request({hostname:u.hostname,path:u.pathname,method:'POST',headers:{'Content-Type':'application/json','Content-Length':Buffer.byteLength(data)}}, res => {
+                let d = '';
+                res.on('data', c => d += c);
+                res.on('end', () => resolve(JSON.parse(d)));
+              });
+              req.on('error', reject);
+              req.write(data);
+              req.end();
+            });
+          }
+          async function main() {
+            const B = 'https://fapi.binance.com';
+            const [k,o,f] = await Promise.all([
+              get(B+'/fapi/v1/klines?symbol='+SYM+'&interval=1h&limit=3'),
+              get(B+'/futures/data/openInterestHist?symbol='+SYM+'&period=1h&limit=3'),
+              get(B+'/fapi/v1/fundingRate?symbol='+SYM+'&limit=3')
+            ]);
+            const cu=k[k.length-1],pr=k[k.length-2],co=o[o.length-1],po=o[o.length-2];
+            const lf=f.length?parseFloat(f[f.length-1].fundingRate):0;
+            const open=parseFloat(cu[1]),close=parseFloat(cu[4]),vol=parseFloat(cu[5]),bvol=parseFloat(cu[9]);
+            const pchg=(close-open)/open*100,br=bvol/vol*100;
+            const oiNow=parseFloat(co.sumOpenInterest),oiPrev=parseFloat(po.sumOpenInterest);
+            const oiChg=(oiNow-oiPrev)/oiPrev*100,fp=lf*100;
+            const s={pchg,br,oiChg,fp,price:close,oi:oiNow,vol};
+            let phase=null;
+            if(oiChg<-1.5&&pchg<-2) phase='flush';
+            else if(oiChg>0.4&&pchg>1.5&&br>55) phase='markup';
+            else if(pchg>0.5&&oiChg<-0.3&&fp>0.06) phase='distribution';
+            else if(Math.abs(oiChg)<0.6&&Math.abs(pchg)<1.2&&fp<0.055) phase='accumulation';
+            if(!phase){console.log('No phase. OI:'+oiChg.toFixed(3)+'% P:'+pchg.toFixed(3)+'% F:'+fp.toFixed(4)+'%');return;}
+            const LABELS={accumulation:'ACCUMULATION',markup:'MARKUP',distribution:'DISTRIBUTION',flush:'FLUSH / CAPITULATION'};
+            const upd=await get('https://api.telegram.org/bot'+TOKEN+'/getUpdates?limit=50');
+            let lastPhase=null;
+            if(upd.ok&&upd.result.length){
+              const cut=Math.floor(Date.now()/1000)-4*3600;
+              const rec=upd.result.filter(u=>u.message&&u.message.from&&u.message.from.is_bot&&u.message.date>cut);
+              if(rec.length){
+                const txt=rec[rec.length-1].message.text||'';
+                if(txt.includes('ACCUMULATION'))lastPhase='accumulation';
+                else if(txt.includes('MARKUP'))lastPhase='markup';
+                else if(txt.includes('DISTRIBUTION'))lastPhase='distribution';
+                else if(txt.includes('FLUSH'))lastPhase='flush';
+              }
+            }
+            console.log('Phase:'+phase+' Last:'+lastPhase);
+            if(phase===lastPhase){console.log('No change');return;}
+            const label=LABELS[phase];
+            const msg=label+' PHASE ALERT\nSymbol: EVAAUSDT\n---\nPrice:     $'+s.price.toFixed(4)+' ('+(s.pchg>=0?'+':'')+s.pchg.toFixed(2)+'%)\nOI:        '+(s.oi/1e6).toFixed(3)+'M ('+(s.oiChg>=0?'+':'')+s.oiChg.toFixed(3)+'%)\nFunding:   '+s.fp.toFixed(4)+'%\nBuy Ratio: '+s.br.toFixed(1)+'%\nVol 1h:    '+(s.vol/1000).toFixed(1)+'K\n---\n'+new Date().toUTCString();
+            const res=await post('https://api.telegram.org/bot'+TOKEN+'/sendMessage',{chat_id:CHAT_ID,text:msg});
+            console.log('Sent:',res.ok,'Phase:',phase);
+          }
+          main().catch(e=>{console.error(e.message);process.exit(1);});
+          NODEEOF
